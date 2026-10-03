@@ -5,7 +5,7 @@ You are the build agent. Do not write any code until you have completed Phase 1 
 ### Phase 1 — Questions and planning
 
 1. Ask the user every question you need answered to build this project: what the app does, who uses it, the core features, what data it stores, what files it handles, what background jobs and scheduled jobs it needs, and what the design should look like. Keep asking until nothing material is unanswered.
-2. Write up a plan covering features, data model, API endpoints, pages, background and scheduled jobs, and a launch checklist. Get the user's explicit approval on the plan before building anything.
+2. Write up a plan covering features, data model, API endpoints, pages, background and scheduled jobs, partition keys (which entities live in Durable Objects and what each object is keyed by), and a launch checklist. Get the user's explicit approval on the plan before building anything.
 3. Design: suggest the user ask their Muse agent to explore design directions using the Figma connector, then hand you the resulting design or Figma link to implement. Do not invent a full visual design unprompted. Implement the design you are given, or ask for one.
 
 ### Phase 2 — Launch credentials check
@@ -41,7 +41,7 @@ The token must include the account under Account Resources. The user can sanity-
 
 ### Context7 — look up current API docs
 
-Libraries change. Before writing code that touches any library API, look up its current documentation with Context7 instead of relying on memory. This applies to everything in the locked stack: Hono, Drizzle, drizzle-zod, Better Auth, React, Vite, Tailwind, and the Cloudflare Workers, D1, R2, Queues, and wrangler APIs.
+Libraries change. Before writing code that touches any library API, look up its current documentation with Context7 instead of relying on memory. This applies to everything in the locked stack: Hono, Drizzle, drizzle-zod, Better Auth, React, Vite, Tailwind, and the Cloudflare Workers, D1, Durable Objects, R2, Queues, Workflows, and wrangler APIs.
 
 1. Check whether Context7 is available in your environment (MCP tools named `resolve-library-id` and `get-library-docs`).
 2. If it is not available, tell the user it is missing and how to add it: `claude mcp add --transport http context7 https://mcp.context7.com/mcp`. Then continue, flagging anything you could not verify.
@@ -52,7 +52,7 @@ Libraries change. Before writing code that touches any library API, look up its 
 
 The stack (locked, do not substitute):
 
-- Cloudflare: Workers, D1, R2, Queues, Cron Triggers, Static Assets. No KV. Do not add a KV binding.
+- Cloudflare: Workers, D1, Durable Objects (SQLite storage), R2, Queues, Workflows, Cron Triggers, Static Assets. No KV. Do not add a KV binding.
 - Libraries: Hono (API), Drizzle (database access), Zod via drizzle-zod (validation), Better Auth (self-hosted logins).
 - Secrets: Doppler only. No .env files anywhere, ever.
 - Frontend: React plus Vite plus Tailwind CSS, built to static files and served from the same Worker as the API.
@@ -61,11 +61,13 @@ Conventions:
 
 - One Worker serves everything: the Hono API under /api/v1 as REST JSON, Better Auth at /api/auth/\*, and the frontend static assets for everything else with SPA fallback.
 - The Drizzle schema in src/db/schema.ts is the single source of truth for all tables, including Better Auth's tables. Derive Zod schemas from it with drizzle-zod. Never hand-write duplicate schemas.
+- Data placement (the scaling rule): global and relational data lives in D1 — accounts, Better Auth tables, settings, anything queried across entities. High-write partitioned state lives in Durable Objects with SQLite storage, one object per partition key (user, workspace, room, document) chosen at plan time. Each object has its own SQLite database and throughput, so writes scale by adding partitions. Reads scale via D1 read replication. Never funnel high-volume entity writes through the single D1 database.
 - Validate every API input. Errors use the envelope { error: { code, message } }. Paginate lists with ?page= and ?per\_page=.
 - Better Auth runs inside the Worker with its data in D1. Its secrets (BETTER\_AUTH\_SECRET, BETTER\_AUTH\_URL) come from Doppler and are synced to Worker secrets at deploy time.
 - Files go in R2. Use presigned URLs so browsers upload directly instead of proxying large files through the Worker.
-- Background work goes on the queue. Recurring work goes on cron triggers. Never build an always-on scheduler process.
-- Local development is `doppler run -- wrangler dev`, which gives a full local stack: local D1 as a SQLite file and emulated R2. `wrangler dev` runs fully local and never needs the Cloudflare token; it only goes out to Cloudflare if the agent passes --remote, which it should not do without asking first.
+- Background work goes on the queue. Multi-step durable work (retries, sleeps, sequential steps) goes on Workflows. Recurring work goes on cron triggers. Never build an always-on scheduler process.
+- Local development is `doppler run -- wrangler dev`, which gives a full local stack: local D1 as a SQLite file, emulated R2, and locally persisted Durable Objects. `wrangler dev` runs fully local and never needs the Cloudflare token; it only goes out to Cloudflare if the agent passes --remote, which it should not do without asking first.
+- Keep write volume low: rows written is the dominant cost line at scale, so never rewrite rows needlessly and batch related writes.
 - Keep the JSON API stable and documented. A future iOS app will consume this same API.
 
 ### Phase 4 — Launch
@@ -73,7 +75,7 @@ Conventions:
 Prerequisites: DOPPLER\_TOKEN is set in the terminal and CF\_API\_TOKEN is in the Doppler dev config (Phase 2 verified). Run every wrangler command under the CF\_API\_TOKEN export from Phase 2, not as `doppler run -- wrangler ...` (which would not give wrangler the name it expects).
 
 1. Install dependencies and build the frontend.
-2. Create the D1 database, the R2 bucket, and the queue. Record their IDs in wrangler.jsonc.
+2. Create the D1 database, the R2 bucket, and the queue. Record their IDs in wrangler.jsonc. Declare Durable Object classes (new_sqlite_classes) and Workflows in wrangler.jsonc — they need no separate creation step.
 3. Apply the Drizzle migrations to the remote D1 database.
 4. Set the secrets in Doppler (generate BETTER\_AUTH\_SECRET, set BETTER\_AUTH\_URL to the final URL), then sync them to Worker secrets.
 5. Run `wrangler deploy` with the token exported.
@@ -87,7 +89,7 @@ Only do this when the user explicitly asks to take the project down. Teardown is
 
 1. Optional but recommended: back up data before deleting anything. Export the D1 database: `CLOUDFLARE_API_TOKEN="$(doppler secrets get CF_API_TOKEN --config dev --plain)" wrangler d1 export <database-name> --output=backup-<name>-<date>.sqlite`. Download any R2 objects worth keeping. Ask the user if they want backups; if they skip it, proceed without.
 2. If the app uses a custom domain, remove the Worker's route or custom domain first: on a Cloudflare-managed zone, delete the DNS record and the Workers route. The workers.dev subdomain is handled in the next step.
-3. Delete the Worker: `wrangler delete <worker-name>`. The workers.dev subdomain, its scheduled cron triggers, and its routes go away with it.
+3. Delete the Worker: `wrangler delete <worker-name>`. The workers.dev subdomain, its scheduled cron triggers, and its routes go away with it. If the app used Durable Objects, remove their namespace data via the Cloudflare dashboard or API as well.
 4. Delete the queue: `wrangler queues delete <queue-name>`.
 5. Delete the D1 database: `wrangler d1 delete <database-name>`. This permanently destroys all app data.
 6. Empty the R2 bucket by deleting all of its objects, then delete the bucket: `wrangler r2 bucket delete <bucket-name>`.
